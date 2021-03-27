@@ -10,6 +10,7 @@ import * as crypto from './util/crypto.js';
 import * as fsUtil from './util/fs.js';
 import {getPlatformSpecificPackageFilename} from './util/package-name-utils.js';
 import {packWithIgnoreAndHeaders} from './cli/commands/pack.js';
+import semver from 'semver';
 
 const fs = require('fs');
 const invariant = require('invariant');
@@ -23,21 +24,27 @@ export type InstallArtifacts = {
 
 export default class PackageInstallScripts {
   constructor(config: Config, resolver: PackageResolver, force: boolean) {
+    this.verboseScripts = config.verboseScripts;
     this.installed = 0;
+    this.installablePkgs = 0;
     this.resolver = resolver;
     this.reporter = config.reporter;
     this.config = config;
     this.force = force;
     this.artifacts = {};
+    this.timings = [];
   }
 
   needsPermission: boolean;
+  verboseScripts: boolean;
   resolver: PackageResolver;
   reporter: Reporter;
   installed: number;
+  installablePkgs: number;
   config: Config;
   force: boolean;
   artifacts: InstallArtifacts;
+  timings: {name: string, version: string, loc: string, stage: string, time: number}[];
 
   setForce(force: boolean) {
     this.force = force;
@@ -103,15 +110,22 @@ export default class PackageInstallScripts {
     this.artifacts[`${pkg.name}@${pkg.version}`] = buildArtifacts;
   }
 
-  async install(cmds: Array<[string, string]>, pkg: Manifest, spinner: ReporterSetSpinner): Promise<void> {
+  async install(
+    cmds: Array<[string, string]>,
+    pkg: Manifest,
+    spinner: ReporterSetSpinner,
+    current: number,
+  ): Promise<void> {
     const ref = pkg._reference;
     invariant(ref, 'expected reference');
     const locs = ref.locations;
 
-    let updateProgress;
 
-    if (cmds.length > 0) {
-      updateProgress = data => {
+    let onProgress;
+
+    // Don't use the spinners if logging detailed timing info
+    if (cmds.length > 0 && !this.verboseScripts) {
+      onProgress = data => {
         const dataStr = data
           .toString() // turn buffer into string
           .trim(); // trim whitespace
@@ -132,16 +146,39 @@ export default class PackageInstallScripts {
     try {
       for (const [stage, cmd] of cmds) {
         await Promise.all(
-          locs.map(async loc => {
+          locs.map(async (loc, i) => {
+            const prefix = `[${current}${locs.length > 1 ? `(${i + 1})` : ''}/${this.installablePkgs}]`;
+            const relativeLoc = loc.substr(loc.indexOf('node_modules'));
+            const locInfo = locs.length > 1 ? ` (${this.reporter.format.gray(relativeLoc)})` : '';
+            const pkgInfo = `${pkg.name}@${pkg.version}${locInfo}`;
+            if (this.verboseScripts) {
+              this.reporter.info(`${prefix} Running ${pkgInfo} ${stage} (${this.reporter.format.gray(cmd)})${locInfo}`);
+            }
+            const start = Date.now();
             const {stdout} = await executeLifecycleScript({
               stage,
               config: this.config,
               cwd: loc,
               cmd,
-              isInteractive: false,
-              updateProgress,
+              isInteractive: this.verboseScripts,
+              onProgress,
             });
-            this.reporter.verbose(stdout);
+            if (!this.verboseScripts) {
+              this.reporter.verbose(stdout);
+            }
+            const time = Date.now() - start;
+            this.timings.push({
+              time,
+              name: pkg.name,
+              version: pkg.version,
+              loc: relativeLoc,
+              stage,
+            });
+
+            const totalTime = (time / 1000).toFixed(2);
+            if (this.verboseScripts) {
+              this.reporter.info(`${prefix} Finished ${pkgInfo} ${stage} in ${totalTime}s`);
+            }
           }),
         );
       }
@@ -205,8 +242,9 @@ export default class PackageInstallScripts {
 
   async runCommand(spinner: ReporterSetSpinner, pkg: Manifest): Promise<void> {
     const cmds = this.getInstallCommands(pkg);
-    spinner.setPrefix(++this.installed, pkg.name);
-    await this.install(cmds, pkg, spinner);
+    const current = ++this.installed;
+    spinner.setPrefix(current, pkg.name);
+    await this.install(cmds, pkg, spinner, current);
   }
 
   // find the next package to be installed
@@ -342,12 +380,13 @@ export default class PackageInstallScripts {
   }
 
   async init(seedPatterns: Array<string>): Promise<void> {
+    this.timings = [];
     const connectionsToRemove = this.getConnectionsToRemoveToGetAcyclicGraph(seedPatterns);
 
     const workQueue = new Set();
     const installed = new Set();
     const pkgs = this.resolver.getTopologicalManifests(seedPatterns);
-    let installablePkgs = 0;
+    this.installablePkgs = 0;
     // A map to keep track of what files exist before installation
     const beforeFilesMap = new Map();
     for (const pkg of pkgs) {
@@ -357,14 +396,18 @@ export default class PackageInstallScripts {
         await Promise.all(
           ref.locations.map(async loc => {
             beforeFilesMap.set(loc, await this.walk(loc));
-            installablePkgs += 1;
+            this.installablePkgs += 1;
           }),
         );
       }
       workQueue.add(pkg);
     }
 
-    const set = this.reporter.activitySet(installablePkgs, Math.min(installablePkgs, this.config.childConcurrency));
+    if (this.verboseScripts) {
+      this.reporter.disableProgress();
+    }
+    const workerCount = Math.min(this.installablePkgs, this.config.childConcurrency);
+    const set = this.reporter.activitySet(this.installablePkgs, workerCount);
 
     // waitQueue acts like a semaphore to allow workers to register to be notified
     // when there are more work added to the work queue
@@ -422,5 +465,26 @@ export default class PackageInstallScripts {
     }
 
     set.end();
+
+    if (this.verboseScripts) {
+      this.reporter.enableProgress();
+
+      const format = this.reporter.format;
+      this.reporter.info(`\n\n${format.bold(format.underline('Time taken by package scripts'))}\n`);
+
+      const timingsHeader = ['Package', 'Version', 'Stage', 'Time', '  Location'];
+      const timingsBody = this.timings
+        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : semver.lt(a.version, b.version) ? -1 : 1))
+        .map(({name, version, loc, stage, time}) => {
+          let timeStr = `${(time / 1000).toFixed(2)}s`;
+          if (time > 20 * 1000) {
+            timeStr = format.bold(format.red(timeStr));
+          } else if (time > 10 * 1000) {
+            timeStr = format.bold(format.yellow(timeStr));
+          }
+          return [name, version, format.gray(stage), timeStr, '  ' + format.gray(loc)];
+        });
+      this.reporter.table(timingsHeader, [...timingsBody, Array(timingsHeader.length).fill('')]);
+    }
   }
 }

@@ -71,6 +71,8 @@ export type ConfigOptions = {
   focus?: boolean,
 
   otp?: string,
+
+  verboseScripts?: boolean,
 };
 
 type PackageMetadata = {
@@ -207,6 +209,8 @@ export default class Config {
   autoAddIntegrity: boolean;
 
   otp: ?string;
+
+  verboseScripts: boolean;
 
   /**
    * Execute a promise produced by factory if it doesn't exist in our cache with
@@ -499,6 +503,8 @@ export default class Config {
     this.focusedWorkspaceName = '';
 
     this.otp = opts.otp || '';
+
+    this.verboseScripts = !!opts.verboseScripts;
   }
 
   /**

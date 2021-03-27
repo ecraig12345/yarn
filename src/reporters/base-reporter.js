@@ -305,6 +305,10 @@ export default class BaseReporter {
     this.noProgress = true;
   }
 
+  enableProgress() {
+    this.noProgress = false;
+  }
+
   //
   prompt<T>(message: string, choices: Array<*>, options?: PromptOptions = {}): Promise<Array<T>> {
     return Promise.reject(new Error('Not implemented'));
